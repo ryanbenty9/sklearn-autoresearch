@@ -33,8 +33,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-TEST_SIZE = 0.2           # hold-out test fraction
-VAL_SIZE = 0.15           # validation fraction (from training set)
+TEST_SIZE = 0.1           # hold-out test fraction
+VAL_SIZE = 0.1            # validation fraction (from training set)
 RANDOM_STATE = 42         # reproducible splits
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sklearn-autoresearch")
 
@@ -75,16 +75,20 @@ BUILTIN_DATASETS = {
 
 def detect_task_type(y):
     """Auto-detect classification vs regression from the target column."""
-    if hasattr(y, "dtype") and np.issubdtype(y.dtype, np.floating):
-        n_unique = len(np.unique(y))
-        if n_unique <= 20:
+    # String/object types are always classification
+    if hasattr(y, "dtype"):
+        dtype_str = str(y.dtype).lower()
+        if "string" in dtype_str or "object" in dtype_str or "category" in dtype_str:
             return "classification"
-        return "regression"
-    if hasattr(y, "dtype") and (np.issubdtype(y.dtype, np.integer) or np.issubdtype(y.dtype, np.object_)):
-        n_unique = len(np.unique(y))
-        if n_unique <= 50:
+        try:
+            if np.issubdtype(y.dtype, np.floating):
+                n_unique = len(np.unique(y))
+                return "classification" if n_unique <= 20 else "regression"
+            if np.issubdtype(y.dtype, np.integer):
+                n_unique = len(np.unique(y))
+                return "classification" if n_unique <= 50 else "regression"
+        except TypeError:
             return "classification"
-        return "regression"
     # Fallback: check if values look categorical
     n_unique = len(set(y))
     if n_unique <= 20:
@@ -112,13 +116,40 @@ def _load_builtin(name):
     return df, "target"
 
 
-def _load_csv(csv_path, target_column):
-    """Load a CSV file, return (df, target_column_name)."""
+def _load_csv(csv_path, target_column, feature_columns=None, ignore_columns=None):
+    """Load a CSV file, return (df, target_column_name).
+
+    feature_columns: if provided, only these columns (+ target) are kept.
+    ignore_columns: if provided, these columns are dropped.
+    """
     df = pd.read_csv(csv_path)
     if target_column not in df.columns:
         print(f"Error: target column '{target_column}' not found in CSV.")
         print(f"Available columns: {list(df.columns)}")
         sys.exit(1)
+
+    if feature_columns and ignore_columns:
+        print("Error: --features and --ignore are mutually exclusive.")
+        sys.exit(1)
+
+    if feature_columns:
+        missing = [c for c in feature_columns if c not in df.columns]
+        if missing:
+            print(f"Error: feature columns not found in CSV: {missing}")
+            print(f"Available columns: {list(df.columns)}")
+            sys.exit(1)
+        keep = feature_columns + [target_column]
+        df = df[keep]
+        print(f"Using {len(feature_columns)} specified feature columns")
+
+    if ignore_columns:
+        missing = [c for c in ignore_columns if c not in df.columns]
+        if missing:
+            print(f"Warning: ignore columns not found (skipping): {missing}")
+        to_drop = [c for c in ignore_columns if c in df.columns and c != target_column]
+        df = df.drop(columns=to_drop)
+        print(f"Ignored {len(to_drop)} columns: {to_drop}")
+
     return df, target_column
 
 
@@ -135,23 +166,31 @@ def prepare_data(df, target_col):
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
 
+    # Convert Arrow-backed string columns to object dtype for numpy compatibility
+    for col in df.columns:
+        if pd.api.types.is_string_dtype(df[col]):
+            df[col] = df[col].astype("object")
+
     y = df[target_col].values
     X = df.drop(columns=[target_col])
 
     task_type = detect_task_type(y)
-    stratify = y if task_type == "classification" else None
+
+    # Stratified split when possible, fallback to non-stratified for rare classes
+    def safe_split(X, y, test_size, task_type):
+        if task_type == "classification":
+            try:
+                return train_test_split(X, y, test_size=test_size,
+                                        random_state=RANDOM_STATE, stratify=y)
+            except ValueError:
+                print("Warning: some classes too rare for stratified split, using shuffle split")
+        return train_test_split(X, y, test_size=test_size, random_state=RANDOM_STATE)
 
     # First split: train+val vs test
-    X_trainval, X_test, y_trainval, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=stratify,
-    )
+    X_trainval, X_test, y_trainval, y_test = safe_split(X, y, TEST_SIZE, task_type)
 
     # Second split: train vs val
-    stratify_val = y_trainval if task_type == "classification" else None
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_trainval, y_trainval, test_size=VAL_SIZE, random_state=RANDOM_STATE,
-        stratify=stratify_val,
-    )
+    X_train, X_val, y_train, y_val = safe_split(X_trainval, y_trainval, VAL_SIZE, task_type)
 
     # Save splits
     np.save(os.path.join(CACHE_DIR, "X_train.npy"), X_train.values, allow_pickle=True)
@@ -319,6 +358,10 @@ if __name__ == "__main__":
                         help="Use a sklearn built-in dataset")
     parser.add_argument("--csv", type=str, help="Path to a CSV file")
     parser.add_argument("--target", type=str, help="Target column name (required with --csv)")
+    parser.add_argument("--features", type=str, nargs="+",
+                        help="Explicit list of feature columns to use (mutually exclusive with --ignore)")
+    parser.add_argument("--ignore", type=str, nargs="+",
+                        help="Columns to drop (e.g. IDs, timestamps). Mutually exclusive with --features")
     args = parser.parse_args()
 
     if args.csv:
@@ -326,7 +369,9 @@ if __name__ == "__main__":
             print("Error: --target is required when using --csv")
             sys.exit(1)
         print(f"Loading CSV: {args.csv}")
-        df, target_col = _load_csv(args.csv, args.target)
+        df, target_col = _load_csv(args.csv, args.target,
+                                   feature_columns=args.features,
+                                   ignore_columns=args.ignore)
     elif args.dataset:
         print(f"Loading built-in dataset: {args.dataset}")
         print(f"  {BUILTIN_DATASETS[args.dataset]['description']}")
@@ -339,6 +384,8 @@ if __name__ == "__main__":
         print("Usage:")
         print("  python prepare.py --dataset california")
         print("  python prepare.py --csv data.csv --target price")
+        print("  python prepare.py --csv data.csv --target price --ignore id timestamp")
+        print("  python prepare.py --csv data.csv --target price --features age income zipcode")
         sys.exit(0)
 
     print(f"\nDataset shape: {df.shape}")

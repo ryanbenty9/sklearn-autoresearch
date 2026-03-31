@@ -5,11 +5,13 @@ Usage: python train.py
 """
 
 import time
-import traceback
 
-from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OrdinalEncoder
 
 from prepare import (
     load_metadata, load_train_data, load_val_data,
@@ -31,30 +33,41 @@ def build_features(X):
 # Model & Pipeline (edit this section)
 # ---------------------------------------------------------------------------
 
-def build_pipeline(metadata):
+def build_pipeline(metadata, X_train):
     """
     Build and return an sklearn Pipeline.
     metadata contains: task_type, n_features, n_train, n_classes, feature_names, etc.
     """
     task_type = metadata["task_type"]
 
+    # Detect column types
+    cat_cols = X_train.select_dtypes(include=["object", "category", "string"]).columns.tolist()
+    num_cols = X_train.select_dtypes(include=["number"]).columns.tolist()
+
+    # HistGradientBoosting handles NaN natively, only need to encode categoricals
+    preprocessor = ColumnTransformer([
+        ("num", "passthrough", num_cols),
+        ("cat", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1), cat_cols),
+    ])
+
     if task_type == "classification":
-        model = GradientBoostingClassifier(
-            n_estimators=100,
+        model = HistGradientBoostingClassifier(
+            max_iter=100,
             learning_rate=0.1,
-            max_depth=3,
+            max_depth=6,
             random_state=42,
+            early_stopping=False,
         )
     else:
-        model = GradientBoostingRegressor(
-            n_estimators=100,
+        model = HistGradientBoostingRegressor(
+            max_iter=100,
             learning_rate=0.1,
-            max_depth=3,
+            max_depth=6,
             random_state=42,
         )
 
     pipeline = Pipeline([
-        ("scaler", StandardScaler()),
+        ("preprocessor", preprocessor),
         ("model", model),
     ])
 
@@ -76,7 +89,7 @@ if __name__ == "__main__":
     X_val = build_features(X_val)
 
     # Build and fit
-    pipeline = build_pipeline(metadata)
+    pipeline = build_pipeline(metadata, X_train)
     pipeline.fit(X_train, y_train)
 
     t_train = time.time() - t_start
